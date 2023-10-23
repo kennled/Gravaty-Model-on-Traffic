@@ -1,0 +1,187 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import networkx as nx
+from tqdm import tqdm
+
+def haversine(lon1, lat1, lon2, lat2):
+    lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return c * 6367 * 1000
+
+# Read the CSV file
+speed_data = pd.read_csv('2019.02.19.csv')
+
+# Group by 'LinkID' and find the maximum 'SpeedBand' within each group, rename the column to 'MaxSpeed'
+max_speed_by_linkid = speed_data.groupby('LinkID')['SpeedBand'].max().rename('MaxSpeed')
+
+#Read the CSV file
+roadnetwork = pd.read_csv('2019.02.19.csv',nrows=58780)
+
+# Merge max_speed_by_linkid with roadnetwork DataFrame on 'LinkID'
+roadnetwork = roadnetwork.merge(max_speed_by_linkid, left_on='LinkID', right_index=True, how='left')
+# Create a dictionary mapping link ids to their respective start and end points
+locations = roadnetwork["Location"].str.split().apply(lambda x: tuple(map(float, x))).tolist()
+sp = [tuple(map(float, x.split()))[:2] for x in roadnetwork["Location"]]
+ep = [tuple(map(float, x.split()))[2:] for x in roadnetwork["Location"]]
+
+roadnetwork["StartPoint"]=sp
+roadnetwork["EndPoint"]=ep
+
+#Calculate the center point for each link
+roadnetwork["CenterPoint"] = roadnetwork[["StartPoint", "EndPoint"]].apply(lambda row: ((row["StartPoint"][0] + row["EndPoint"][0]) / 2, (row["StartPoint"][1] + row["EndPoint"][1]) / 2), axis=1)
+#this is already half(length)
+roadnetwork["length"] = roadnetwork.apply(lambda row: haversine(row["CenterPoint"][0], row["CenterPoint"][1], row["EndPoint"][0], row["EndPoint"][1])/ row['MaxSpeed'], axis=1)
+# Create separate "Latitude" and "Longitude" columns from "CenterPoint"
+roadnetwork[["latitude","longitude" ]] = roadnetwork["CenterPoint"].apply(lambda point: pd.Series([point[0], point[1]]))
+
+# Read the JSON file into a DataFrame(LU for landuse)
+LU = pd.read_json('SG_landuse_wGPR.json')
+
+# Define a function to round the coordinates
+def round_coordinates(coords):
+    for ring in coords['rings']:
+        for coord in ring:
+            coord[0] = round(coord[0], 13)
+            coord[1] = round(coord[1], 13)
+    return coords
+
+def calculate_polygon_center(coords):
+    num_points = 0
+    x_sum = 0
+    y_sum = 0
+
+    for ring in coords['rings']:
+        for x, y in ring:
+            x_sum += x
+            y_sum += y
+            num_points += 1
+
+    center_x = x_sum / num_points
+    center_y = y_sum / num_points
+
+    return center_x, center_y
+
+def area_diameter(coords):
+    
+    max_longitude, max_latitude = float('-inf'), float('-inf')
+    min_longitude, min_latitude = float('inf'), float('inf')
+
+    for ring in coords['rings']:
+        for coord in ring:
+            lon, lat = coord[0], coord[1]
+            max_longitude = max(max_longitude, lon)
+            max_latitude = max(max_latitude, lat)
+            min_longitude = min(min_longitude, lon)
+            min_latitude = min(min_latitude, lat)
+    
+    distance = haversine(max_longitude, max_latitude, min_longitude, min_latitude)
+
+    return distance
+
+#only keep 'RESIDENTIAL', 'COMMERCIAL'
+LU['LU_DESC'] = LU['attributes'].apply(lambda x: x['LU_DESC'])
+
+LU = LU[LU['LU_DESC'].isin([ 'RESIDENTIAL', 'COMMERCIAL'])]
+
+# Apply the function to the 'rings' list in the 'geometry' column（fixed fractional part)
+LU['geometry'] = LU['geometry'].apply(round_coordinates)
+
+# Calculate the center point
+LU['center'] = LU['geometry'].apply(calculate_polygon_center)
+LU['GPR_NUM'] = LU['attributes'].apply(lambda x: x['GPR_NUM'])
+LU['SHAPE_Area'] = LU['attributes'].apply(lambda x: x['SHAPE_Area'])
+LU['diameter']=LU['geometry'].apply(area_diameter)
+LU[["longitude","latitude"]] = LU["center"].apply(lambda point: pd.Series([point[0], point[1]]))
+LU.drop(columns=['attributes'], inplace=True)
+LU.drop(columns=['geometry'], inplace=True)
+
+#find the mean value of the 'GPR_NUM' column for their respective 'LU_DESC'
+mean_gpr_by_lu = LU.groupby('LU_DESC')['GPR_NUM'].mean()
+
+# Replace'GPR_NUM'0 or NaN to mean by group
+LU['GPR_NUM'] = LU.apply(lambda row: mean_gpr_by_lu[row['LU_DESC']] if (row['GPR_NUM'] == 0 or pd.isnull(row['GPR_NUM'])) else row['GPR_NUM'], axis=1)
+
+num_unique_LU_DESC = LU['LU_DESC'].nunique()
+print("Number of different LU_DESC:", num_unique_LU_DESC)
+
+unique_LU_DESC = LU['LU_DESC'].unique()
+print("Different LU_DESC values:", unique_LU_DESC)
+
+LU['EP']=LU['SHAPE_Area']*LU['GPR_NUM']
+
+LU['No_nodes_around'] = np.zeros(len(LU))
+
+# Define the area boundaries
+min_lat, max_lat, min_lon, max_lon = [1.26523 , 1.3000 , 103.8130, 103.8600]
+
+# small area
+LU = LU[(LU['longitude'] >= min_lon) & 
+        (LU['longitude'] <= max_lon) &
+        (LU['latitude'] >= min_lat) & 
+        (LU['latitude'] <= max_lat)]
+roadnetwork = roadnetwork[(roadnetwork['longitude'] >= min_lon) & 
+             (roadnetwork['longitude'] <= max_lon) &
+             (roadnetwork['latitude'] >= min_lat) & 
+             (roadnetwork['latitude'] <= max_lat)]
+
+# loop through each unique LU_DESC value in test
+for lu in LU['LU_DESC'].unique():
+    filtered_test=LU[LU['LU_DESC']==lu]
+    # Create a new column "EP" with zero values for all LU_DESC values
+    roadnetwork["EP_"+lu] = np.zeros(len(roadnetwork))
+    for land_index, land_row in tqdm(filtered_test.iterrows(),total=len(filtered_test[filtered_test['LU_DESC'] == lu]), desc="Processing one"):
+        # initialize variables to keep track of nodes around
+        nodes_around = []
+        disofroad={}
+        # loop through each row in the roadnetwork
+        for node_index, node_row in roadnetwork.iterrows():
+            # calculate distance between current node and current land in test
+            dist = haversine(land_row['longitude'], land_row['latitude'], node_row['longitude'], node_row['latitude'])
+            # if distance is around, add node to list
+            if dist <= land_row['diameter']*2:
+                nodes_around.append(node_index)
+                disofroad[node_index] = dist
+        if len(nodes_around) == 0:
+            LU.loc[land_index, 'No_nodes_around'] = 1
+        # add EP values of filtered_test to node_df for nodes around
+        if len(nodes_around) > 0:
+            roadnetwork.loc[nodes_around, 'EP_'+lu] += land_row['EP'] / len(nodes_around) 
+
+#print the number that have nodes around
+print('the number that have nodes around',LU['No_nodes_around'].value_counts()[0],'total number',len(LU))
+ep_columns = [col for col in roadnetwork.columns if "EP_" in col]
+# use the max function to find the maximum value for each row, only including the specified columns
+roadnetwork["max_EP"] = roadnetwork[ep_columns].max(axis=1)
+# get the column index for the maximum value of the specified columns
+max_cols = roadnetwork[ep_columns].idxmax(axis=1)
+# extract the relevant part of the column name to get the corresponding LU_DESC value
+max_EP_lu = max_cols.apply(lambda col: col.split("_")[1])
+# add the new column to the dataframe
+roadnetwork["max_EP_lu"] = max_EP_lu
+roadnetwork.loc[roadnetwork["max_EP"] == 0, "max_EP_lu"] = 'None'
+unique_max_EP_lu = roadnetwork['max_EP_lu'].unique()
+
+# Create a new column 'group' by encoding the 'max_EP_lu' values as integers
+roadnetwork['group'], _ = pd.factorize(roadnetwork['max_EP_lu'])
+roadnetwork.to_csv('node.csv')
+
+# Create a new empty graph
+G = nx.DiGraph()
+# Add all nodes to the graph with their attributes
+for _, row in roadnetwork.iterrows():
+    G.add_node(row['LinkID'], max_EP_lu=row['max_EP_lu'], group=row['group'], latitude=row['latitude'], longitude=row['longitude'], EP=row['max_EP'])
+# Iterate over the rows in data frame
+for _, row in tqdm(roadnetwork.iterrows(),total=len(roadnetwork),desc='Adding Edges'):
+    # Check if the end point of a link matches the start point of another link
+    next_links = roadnetwork[roadnetwork['StartPoint'] == row['EndPoint']]
+    for _, next_row in next_links.iterrows():
+        # Check if the start point of the next link equals the end point of the current link and vice versa
+        if not ((row['StartPoint'] == next_row['EndPoint']) and (row['EndPoint'] == next_row['StartPoint'])):
+            # Calculate the distance between the two nodes using the haversine function
+            distance = row['length']+next_row['length']
+            # Add an edge between the two nodes with the weight set to the distance between them
+            G.add_edge(next_row['LinkID'], row['LinkID'], weight=distance) 
